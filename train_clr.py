@@ -1,0 +1,249 @@
+import tensorflow as tf
+import tensorflow_probability as tfp
+import tensorflow_addons as tfa 
+from tensorflow.keras import mixed_precision
+from tqdm import tqdm
+import numpy as np
+from clr_bnn import CLR_BNN
+
+tfd = tfp.distributions
+
+class CLR_BNN_Trainer:
+    """
+    Trainer class encapsulating the training logic for CLR-BNN.
+    """
+    def __init__(self, model, num_classes=10, initial_lr=1e-5, steps_per_epoch=1000, train_dataset_size=None):
+        """
+        Initializes the trainer.
+        
+        Args:
+            model (CLR_BNN): The model instance to train.
+            num_classes (int): Number of object categories.
+            initial_lr (float): Initial learning rate.
+            steps_per_epoch (int): Steps per epoch for LR scheduling.
+        """
+        self.model = model
+        self.num_classes = num_classes
+        
+        if train_dataset_size is not None and train_dataset_size > 0:
+            self.kl_weight = 1.0 / float(train_dataset_size)
+            print(f"✅ KL Weight ajustado automáticamente: {self.kl_weight:.6f} (1/{train_dataset_size})")
+        else:
+            # Fallback seguro si no sabemos el tamaño
+            self.kl_weight = 1.0 / 1000.0 
+            print(f"⚠️ Dataset size desconocido. Usando KL Weight por defecto: {self.kl_weight}")
+        
+        # --- METRICS TRACKERS ---
+        # These allow us to average the loss over the whole epoch
+        self.tracker_loss = tf.keras.metrics.Mean(name="loss")
+        self.tracker_cls = tf.keras.metrics.Mean(name="cls_loss")
+        self.tracker_box = tf.keras.metrics.Mean(name="box_loss")
+        self.tracker_kl = tf.keras.metrics.Mean(name="kl_loss")
+        
+        # --- OPTIMIZER SETUP ---
+        # Ref: Table I "Optimizer and learning rate"
+        self.lr_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
+            initial_learning_rate=initial_lr,
+            decay_steps=steps_per_epoch * 80, 
+            end_learning_rate=1e-6,
+            power=0.5
+        )
+        
+        base_optimizer = tfa.optimizers.LAMB(
+            learning_rate=self.lr_schedule,
+            clipnorm=0.5
+        )
+        
+        self.optimizer = mixed_precision.LossScaleOptimizer(base_optimizer)
+        
+        self.cls_loss_fn = tf.keras.losses.BinaryFocalCrossentropy(
+            gamma=2.0, alpha=0.25, from_logits=False, reduction=tf.keras.losses.Reduction.NONE
+        )
+
+    def split_targets_by_level(self, y_true, grid_sizes):
+        """
+        Splits ground truth tensors to match the pyramid levels.
+        
+        Args:
+            y_true (tf.Tensor): Concatenated ground truth tensor (Batch, Total_Anchors, K).
+            grid_sizes (list): List of grid dimensions [152, 76, ...].
+            
+        Returns:
+            list[tf.Tensor]: List of ground truth tensors for each level.
+        """
+        split_sizes = [ (g**2) * 9 for g in grid_sizes ]
+        return tf.split(y_true, split_sizes, axis=1)
+
+    def compute_loss(self, y_true_cls, y_true_box, cls_outputs, box_outputs):
+        """
+        Computes the total loss (ELBO).
+        
+        Args:
+            y_true_cls (tf.Tensor): Ground truth classes.
+            y_true_box (tf.Tensor): Ground truth boxes.
+            cls_outputs (list): Model class predictions.
+            box_outputs (list): Model box distributions.
+            
+        Returns:
+            tuple: (total_loss, cls_loss, box_loss, kl_loss).
+        """
+        grid_sizes = [80, 40, 20, 10, 5] 
+        targets_cls_levels = self.split_targets_by_level(y_true_cls, grid_sizes)
+        targets_box_levels = self.split_targets_by_level(y_true_box, grid_sizes)
+        
+        total_cls_loss = 0.0
+        total_box_loss = 0.0
+        
+        for i in range(len(grid_sizes)):
+            y_cls = targets_cls_levels[i]
+            y_box = targets_box_levels[i]
+            pred_cls = cls_outputs[i]
+            pred_dist = box_outputs[i] 
+            
+            # --- 1. CLASSIFICATION ---
+            pred_cls = tf.reshape(pred_cls, tf.shape(y_cls))
+            positive_mask = tf.reduce_max(y_cls, axis=-1) > 0 
+            positive_mask_float = tf.cast(positive_mask, dtype=tf.float32)
+            num_positives = tf.reduce_sum(positive_mask_float)
+            
+            normalizer = tf.maximum(1.0, num_positives)
+            if num_positives == 0:
+                normalizer = tf.cast(tf.shape(y_cls)[1], tf.float32)
+            
+            curr_cls_loss = self.cls_loss_fn(y_cls, pred_cls)
+            total_cls_loss += tf.reduce_sum(curr_cls_loss) / normalizer
+
+            # --- 2. REGRESSION (NLL) ---
+            H, W = grid_sizes[i], grid_sizes[i]
+            y_box_reshaped = tf.reshape(y_box, (-1, H, W, 36))
+            y_box_reshaped = tf.cast(y_box_reshaped, tf.float32)
+            
+            if num_positives > 0:
+                nll_spatial = -pred_dist.log_prob(y_box_reshaped)
+                nll_flat = tf.reshape(nll_spatial, (-1, H * W))
+                
+                pos_mask_reshaped = tf.reshape(positive_mask, (-1, H * W, 9))
+                pos_mask_cell = tf.reduce_any(pos_mask_reshaped, axis=-1)
+                pos_mask_cell_float = tf.cast(pos_mask_cell, dtype=tf.float32)
+                
+                nll_safe = tf.where(tf.math.is_finite(nll_flat), nll_flat, tf.zeros_like(nll_flat))
+                
+                curr_box_loss = tf.reduce_sum(nll_safe * pos_mask_cell_float)
+                total_box_loss += curr_box_loss / normalizer
+
+        raw_kl = tf.cast(tf.reduce_sum(self.model.losses), tf.float32)
+        kl_loss = raw_kl * self.kl_weight
+        total_loss = total_cls_loss + total_box_loss + kl_loss
+        return total_loss, total_cls_loss, total_box_loss, kl_loss
+
+    @tf.function
+    def train_step(self, images, lidar, radar, target_cls, target_box):
+        """
+        Runs a single training step.
+        
+        Args:
+            images (tf.Tensor): Batch of images.
+            lidar (tf.Tensor): Batch of LiDAR data.
+            radar (tf.Tensor): Batch of RADAR data.
+            target_cls (tf.Tensor): Classification labels.
+            target_box (tf.Tensor): Box targets.
+            
+        Returns:
+            dict: Loss metrics for the step.
+        """
+        with tf.GradientTape() as tape:
+            cls_outs, box_outs = self.model([images, lidar, radar], training=True)
+            loss, l_c, l_b, l_kl = self.compute_loss(target_cls, target_box, cls_outs, box_outs)
+            scaled_loss = self.optimizer.get_scaled_loss(loss)
+        
+        scaled_grads = tape.gradient(scaled_loss, self.model.trainable_variables)
+        grads = self.optimizer.get_unscaled_gradients(scaled_grads)
+        
+        grads_ok = [tf.where(tf.math.is_nan(g), tf.zeros_like(g), g) if g is not None else g for g in grads]
+        self.optimizer.apply_gradients(zip(grads_ok, self.model.trainable_variables))
+        
+        # Update metrics tracking
+        self.tracker_loss.update_state(loss)
+        self.tracker_cls.update_state(l_c)
+        self.tracker_box.update_state(l_b)
+        self.tracker_kl.update_state(l_kl)
+        
+        return {"loss": loss, "cls": l_c, "box": l_b, "kl": l_kl}
+
+    def fit(self, dataset, epochs=1):
+        """
+        Main Training Loop with Progress Bar.
+        """
+        for epoch in range(epochs):
+            print(f"\nEpoch {epoch+1}/{epochs}")
+            
+            # Reset metrics at start of epoch
+            self.tracker_loss.reset_states()
+            self.tracker_cls.reset_states()
+            self.tracker_box.reset_states()
+            self.tracker_kl.reset_states()
+            
+            # Progress bar for the dataset
+            # 'desc' shows the metrics updating in real-time
+            pbar = tqdm(dataset, unit="batch")
+            
+            for step, (inputs, targets) in enumerate(pbar):
+                img, lid, rad = inputs
+                y_c, y_b = targets
+                
+                logs = self.train_step(img, lid, rad, y_c, y_b)
+                
+                # Update progress bar description with current mean loss
+                pbar.set_postfix({
+                    "Loss": f"{self.tracker_loss.result():.4f}",
+                    "Cls": f"{self.tracker_cls.result():.4f}",
+                    "Box": f"{self.tracker_box.result():.4f}",
+                    "KL": f"{self.tracker_kl.result():.4f}"
+                })
+
+            # End of Epoch Summary
+            print(f"End of Epoch {epoch+1}: Total Loss: {self.tracker_loss.result():.4f}")    
+
+
+# ==============================================================================
+# DATA SIMULATION FOR TESTING
+# ==============================================================================
+def create_dummy_dataset(num_batches=50, batch_size=2):
+    """Generates a fake tf.data.Dataset to simulate training flow."""
+    
+    # 1. Create one batch of fake data
+    img = tf.random.normal((batch_size, 320, 320, 3))
+    lid = tf.random.normal((batch_size, 320, 320, 2))
+    rad = tf.zeros((batch_size, 320, 320, 2))
+    
+    # Anchors for 320x320 -> 76725
+    y_cls = tf.zeros((batch_size, 76725, 10))
+    y_box = tf.zeros((batch_size, 76725, 4))
+    
+    # 2. Repeat this batch 'num_batches' times
+    inputs = (img, lid, rad)
+    targets = (y_cls, y_box)
+    
+    dataset = tf.data.Dataset.from_tensors((inputs, targets)).repeat(num_batches)
+    return dataset
+
+
+if __name__ == "__main__":
+    print("Initializing Model (320x320)...")
+    
+    model = CLR_BNN(num_classes=10, input_shape=(320, 320))
+    trainer = CLR_BNN_Trainer(model, initial_lr=1e-5, train_dataset_size=100) # Low LR for stability
+    
+    print("Creating Simulated Dataset (50 batches)...")
+    # Simulate a dataset with 50 batches of size 2
+    dummy_ds = create_dummy_dataset(num_batches=50, batch_size=2)
+    
+    print("Starting Training Loop...")
+    # Train for 3 epochs
+    try:
+        trainer.fit(dummy_ds, epochs=3)
+        print("\nTraining Finished Successfully!")
+    except Exception as e:
+        print(f"\nCRITICAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
