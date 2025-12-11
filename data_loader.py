@@ -1,302 +1,154 @@
-"""
-NUSCENES DATA LOADER FOR CLR-BNN
-================================
-Handles loading, sensor synchronization, 3D-to-2D projection, and Anchor Encoding.
-
-Requirements:
-    pip install nuscenes-devkit pyquaternion
-"""
-
+import os
 import tensorflow as tf
 import numpy as np
 import cv2
-import os
-from pyquaternion import Quaternion
-from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.data_classes import LidarPointCloud, RadarPointCloud
-from nuscenes.utils.geometry_utils import view_points
 
-class AnchorEncoder:
-    """
-    Transforms raw 2D bounding boxes into the target format for RetinaNet/CLR-BNN.
-    """
-    def __init__(self, input_shape=(320, 320), num_classes=10):
+# --- ANCHOR BOX LOGIC (Integrated) ---
+class AnchorBox:
+    def __init__(self, input_shape=(320, 320), min_size=320):
         self.input_shape = input_shape
-        self.num_classes = num_classes
-        # FPN Strides for P3-P7 (Shifted FPN starts at high res)
-        self.strides = [4, 8, 16, 32, 64] 
-        self.sizes = [32, 64, 128, 256, 512] 
-        self.ratios = [0.5, 1.0, 2.0]
-        self.scales = [2**0, 2**(1.0/3.0), 2**(2.0/3.0)]
+        self.min_size = min_size
+        self.aspect_ratios = [0.5, 1.0, 2.0]
+        self.scales = [2 ** x for x in [0, 1/3, 2/3]]
+        self.num_anchors = len(self.aspect_ratios) * len(self.scales)
+        self.strides = [2**i for i in range(3, 8)] # P3..P7
+        self.areas = [32**2, 64**2, 128**2, 256**2, 512**2]
         self.anchors = self._generate_anchors()
 
     def _generate_anchors(self):
-        """Generates the static grid of anchors for all levels."""
-        all_anchors = []
-        for stride, base_size in zip(self.strides, self.sizes):
-            grid_h = self.input_shape[0] // stride
-            grid_w = self.input_shape[1] // stride
+        anchor_list = []
+        for stride, area in zip(self.strides, self.areas):
+            base_anchor_size = np.sqrt(area)
+            y_centers = np.arange(stride / 2, self.input_shape[0], stride)
+            x_centers = np.arange(stride / 2, self.input_shape[1], stride)
+            x_centers, y_centers = np.meshgrid(x_centers, y_centers)
             
-            # Create Grid
-            grid_x = np.arange(grid_w) * stride + stride / 2
-            grid_y = np.arange(grid_h) * stride + stride / 2
-            grid_x, grid_y = np.meshgrid(grid_x, grid_y)
+            widths, heights = [], []
+            for scale in self.scales:
+                for ratio in self.aspect_ratios:
+                    w = np.sqrt(area / ratio)
+                    h = w * ratio
+                    widths.append(w * scale)
+                    heights.append(h * scale)
             
-            centers = np.stack([grid_x.ravel(), grid_y.ravel()], axis=-1)
+            centers = np.stack([x_centers, y_centers], axis=-1).reshape(-1, 2)
+            wh = np.stack([np.array(widths), np.array(heights)], axis=-1)
             
-            # Create Shapes
-            box_sizes = []
-            for ratio in self.ratios:
-                for scale in self.scales:
-                    w = base_size * scale * np.sqrt(ratio)
-                    h = base_size * scale / np.sqrt(ratio)
-                    box_sizes.append([w, h])
-            box_sizes = np.array(box_sizes)
+            centers = np.repeat(centers, self.num_anchors, axis=0)
+            wh = np.tile(wh, (len(x_centers.flatten()), 1))
+            anchor_list.append(np.concatenate([centers, wh], axis=-1))
             
-            # Broadcast centers with sizes
-            num_locs = len(centers)
-            num_shapes = len(box_sizes)
-            
-            # (N_locs, 1, 2) + (1, N_shapes, 2) -> (N_locs, N_shapes, 2)
-            anchors_center = np.tile(centers[:, None, :], (1, num_shapes, 1))
-            anchors_size = np.tile(box_sizes[None, :, :], (num_locs, 1, 1))
-            
-            # Concat (x, y, w, h) and flatten
-            level_anchors = np.concatenate([anchors_center, anchors_size], axis=-1)
-            all_anchors.append(level_anchors.reshape(-1, 4))
-            
-        return np.vstack(all_anchors).astype(np.float32)
+        return np.concatenate(anchor_list, axis=0).astype(np.float32)
 
     def encode(self, gt_boxes, gt_classes):
-        """
-        Matches Ground Truth boxes to Anchors using IoU.
-        Returns:
-            y_cls: (Total_Anchors, Num_Classes)
-            y_box: (Total_Anchors, 4)
-        """
-        # NOTE: This is a simplified O(N^2) encoder. 
-        # For production, use optimized Cython or TF Ops (tf.image.iou).
-        
-        num_anchors = self.anchors.shape[0]
-        y_cls = np.zeros((num_anchors, self.num_classes), dtype=np.float32)
-        y_box = np.zeros((num_anchors, 4), dtype=np.float32)
+        targets_cls = np.zeros((self.anchors.shape[0],), dtype=np.int32)
+        targets_box = np.zeros((self.anchors.shape[0], 4), dtype=np.float32)
         
         if len(gt_boxes) == 0:
-            return y_cls, y_box
+            return np.zeros((self.anchors.shape[0], 14), dtype=np.float32), targets_box
 
-        # 1. Calculate IoU between all Anchors and all GT Boxes
-        # Convert (x,y,w,h) to (x1,y1,x2,y2) for IoU
-        def to_corners(box):
-            return np.stack([box[:,0]-box[:,2]/2, box[:,1]-box[:,3]/2,
-                             box[:,0]+box[:,2]/2, box[:,1]+box[:,3]/2], axis=1)
+        # IoU Calculation
+        anchors_min = self.anchors[:, :2] - self.anchors[:, 2:] / 2
+        anchors_max = self.anchors[:, :2] + self.anchors[:, 2:] / 2
+        anchors_area = self.anchors[:, 2] * self.anchors[:, 3]
         
-        anchors_corn = to_corners(self.anchors)
-        gt_corn = to_corners(gt_boxes)
+        gt_min = gt_boxes[:, :2] - gt_boxes[:, 2:] / 2
+        gt_max = gt_boxes[:, :2] + gt_boxes[:, 2:] / 2
+        gt_area = gt_boxes[:, 2] * gt_boxes[:, 3]
         
-        # Vectorized IoU (Simplified area overlap)
-        # In a real implementation, use a robust library function here.
-        # This is a placeholder for logic flow.
-        
-        # --- LOGIC PLACEHOLDER ---
-        # For each anchor: find max IoU GT.
-        # If IoU > 0.5: Positive (Assign Class 1 & Calculate Delta)
-        # If IoU < 0.4: Negative (Class 0)
-        # Else: Ignore (Mask) - Here we assume 0 for simplicity or use weights.
-        
-        # For this example code to run without heavy deps, we return zeros
-        # assuming the user will plug in a standard `bbox_overlap` function.
-        return y_cls, y_box
+        inter_min = np.maximum(anchors_min[:, None, :], gt_min[None, :, :])
+        inter_max = np.minimum(anchors_max[:, None, :], gt_max[None, :, :])
+        inter_dim = np.maximum(0, inter_max - inter_min)
+        inter_area = inter_dim[:, :, 0] * inter_dim[:, :, 1]
+        iou = inter_area / (anchors_area[:, None] + gt_area[None, :] - inter_area + 1e-6)
 
-class NuScenesGenerator:
-    def __init__(self, nusc_root, version='v1.0-mini', input_shape=(320, 320)):
-        self.nusc = NuScenes(version=version, dataroot=nusc_root, verbose=True)
-        self.input_shape = input_shape
-        self.encoder = AnchorEncoder(input_shape=input_shape)
+        max_iou_ind = np.argmax(iou, axis=1)
+        max_iou = np.max(iou, axis=1)
         
-        # Mapping standard classes to 10 detection classes
-        self.class_map = {
-            'vehicle.car': 0, 'vehicle.truck': 1, 'vehicle.bus.rigid': 2,
-            'vehicle.trailer': 3, 'vehicle.construction': 4, 'human.pedestrian.adult': 5,
-            'vehicle.motorcycle': 6, 'vehicle.bicycle': 7, 'movable_object.trafficcone': 8,
-            'movable_object.barrier': 9
-        }
-        
-        self.samples = self._build_sample_list()
+        # Assign Targets: <0.4 BG, 0.4-0.5 Ignore, >0.5 Object
+        targets_cls[max_iou < 0.4] = 0 
+        targets_cls[(max_iou >= 0.4) & (max_iou < 0.5)] = -1
+        pos_mask = max_iou >= 0.5
+        targets_cls[pos_mask] = gt_classes[max_iou_ind[pos_mask]] + 1 # Class 1..14
 
-    def _build_sample_list(self):
-        """Creates a list of (sample_token, camera_channel) pairs."""
-        samples = []
-        for sample in self.nusc.sample:
-            # We treat each camera image as a training sample
-            for cam in ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 
-                        'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']:
-                if cam in sample['data']:
-                    samples.append((sample['token'], cam))
-        return samples
-
-    def _map_pointcloud_to_image(self, pointsensor_token, camera_token, min_dist=1.0):
-        """
-        Projects 3D points (LiDAR/RADAR) onto the 2D Image plane.
-        """
-        cam = self.nusc.get('sample_data', camera_token)
-        pointsensor = self.nusc.get('sample_data', pointsensor_token)
+        assigned_boxes = gt_boxes[max_iou_ind]
+        targets_box[:, 0] = (assigned_boxes[:, 0] - self.anchors[:, 0]) / self.anchors[:, 2]
+        targets_box[:, 1] = (assigned_boxes[:, 1] - self.anchors[:, 1]) / self.anchors[:, 3]
+        targets_box[:, 2] = np.log(np.maximum(assigned_boxes[:, 2] / self.anchors[:, 2], 1e-6))
+        targets_box[:, 3] = np.log(np.maximum(assigned_boxes[:, 3] / self.anchors[:, 3], 1e-6))
+        targets_box[~pos_mask] = 0
         
-        # 1. Load Point Cloud
-        pcl_path = os.path.join(self.nusc.dataroot, pointsensor['filename'])
-        if 'LIDAR' in pointsensor['channel']:
-            pc = LidarPointCloud.from_file(pcl_path)
+        # One-Hot Encoding (14 Classes)
+        final_cls_onehot = np.zeros((self.anchors.shape[0], 14), dtype=np.float32)
+        pos_indices = np.where(targets_cls > 0)[0]
+        if len(pos_indices) > 0:
+            final_cls_onehot[pos_indices, targets_cls[pos_indices] - 1] = 1.0
+            
+        return final_cls_onehot, targets_box
+
+# --- DATALOADER ---
+class DataLoaderGenerator(tf.keras.utils.Sequence):
+    def __init__(self, data_root, batch_size=4, input_shape=(320, 320), split='train'):
+        self.data_root = data_root
+        self.batch_size = batch_size
+        
+        # List files
+        all_files = sorted([f.split('.')[0] for f in os.listdir(os.path.join(data_root, 'labels')) if f.endswith('.npz')])
+        
+        # Simple split (First 90% train, last 10% val based on Scene ID sort)
+        split_idx = int(len(all_files) * 0.9)
+        if split == 'train':
+            self.tokens = all_files[:split_idx]
         else:
-            pc = RadarPointCloud.from_file(pcl_path)
-
-        # 2. Transform: Sensor -> Ego -> Global -> Ego(Cam) -> Cam
-        cs_record = self.nusc.get('calibrated_sensor', pointsensor['calibrated_sensor_token'])
-        pose_record = self.nusc.get('ego_pose', pointsensor['ego_pose_token'])
-        cam_pose = self.nusc.get('ego_pose', cam['ego_pose_token'])
-        cam_cs = self.nusc.get('calibrated_sensor', cam['calibrated_sensor_token'])
-
-        # Sensor to Ego
-        pc.rotate(Quaternion(cs_record['rotation']).rotation_matrix)
-        pc.translate(np.array(cs_record['translation']))
-        # Ego to Global
-        pc.rotate(Quaternion(pose_record['rotation']).rotation_matrix)
-        pc.translate(np.array(pose_record['translation']))
-        # Global to Ego (Cam)
-        pc.translate(-np.array(cam_pose['translation']))
-        pc.rotate(Quaternion(cam_pose['rotation']).rotation_matrix.T)
-        # Ego (Cam) to Cam
-        pc.translate(-np.array(cam_cs['translation']))
-        pc.rotate(Quaternion(cam_cs['rotation']).rotation_matrix.T)
-
-        # 3. Project to 2D
-        depths = pc.points[2, :]
-        points = view_points(pc.points[:3, :], np.array(cam_cs['camera_intrinsic']), normalize=True)
-
-        # Filter: in front of camera and within image bounds
-        mask = np.ones(depths.shape[0], dtype=bool)
-        mask = np.logical_and(mask, depths > min_dist)
-        mask = np.logical_and(mask, points[0, :] > 1)
-        mask = np.logical_and(mask, points[0, :] < cam['width'] - 1)
-        mask = np.logical_and(mask, points[1, :] > 1)
-        mask = np.logical_and(mask, points[1, :] < cam['height'] - 1)
-
-        return points[:, mask], depths[mask], pc.points[3, mask] if pc.points.shape[0] > 3 else None
+            self.tokens = all_files[split_idx:]
+            
+        self.indexes = np.arange(len(self.tokens))
+        self.encoder = AnchorBox(input_shape=input_shape)
 
     def __len__(self):
-        return len(self.samples)
+        return int(np.floor(len(self.tokens) / self.batch_size))
 
-    def __getitem__(self, idx):
-        sample_token, cam_channel = self.samples[idx]
-        sample = self.nusc.get('sample', sample_token)
-        cam_token = sample['data'][cam_channel]
-        cam_data = self.nusc.get('sample_data', cam_token)
-        
-        # --- 1. IMAGE ---
-        img_path = os.path.join(self.nusc.dataroot, cam_data['filename'])
-        img = cv2.imread(img_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h_orig, w_orig = img.shape[:2]
-        img_resized = cv2.resize(img, self.input_shape) / 255.0 # Normalize 0-1
+    def on_epoch_end(self):
+        np.random.shuffle(self.indexes)
 
-        # --- 2. LIDAR (Projected) ---
-        lidar_token = sample['data']['LIDAR_TOP']
-        pts, depth, intensity = self._map_pointcloud_to_image(lidar_token, cam_token)
-        
-        # Create dense map (H, W, 2) -> [Depth, Intensity]
-        lidar_map = np.zeros((h_orig, w_orig, 2), dtype=np.float32)
-        if pts.shape[1] > 0:
-            # Simple projection: fill pixel with depth
-            pts_y = np.clip(pts[1, :].astype(int), 0, h_orig-1)
-            pts_x = np.clip(pts[0, :].astype(int), 0, w_orig-1)
-            lidar_map[pts_y, pts_x, 0] = depth
-            lidar_map[pts_y, pts_x, 1] = intensity if intensity is not None else 1.0
+    def __getitem__(self, index):
+        indexes = self.indexes[index*self.batch_size:(index+1)*self.batch_size]
+        X_img, X_lid, X_rad, Y_cls, Y_box = [], [], [], [], []
+
+        for k in indexes:
+            token = self.tokens[k]
             
-        lidar_map = cv2.resize(lidar_map, self.input_shape, interpolation=cv2.INTER_NEAREST)
-
-        # --- 3. RADAR (Projected) ---
-        # NuScenes has multiple radars. We aggregate FRONT radars for FRONT camera, etc.
-        # For simplicity, we grab RADAR_FRONT here (adjust logic for side cameras)
-        radar_token = sample['data'].get('RADAR_FRONT')
-        radar_map = np.zeros((h_orig, w_orig, 2), dtype=np.float32)
-        
-        if radar_token:
-            pts, depth, rcs = self._map_pointcloud_to_image(radar_token, cam_token)
-            if pts.shape[1] > 0:
-                pts_y = np.clip(pts[1, :].astype(int), 0, h_orig-1)
-                pts_x = np.clip(pts[0, :].astype(int), 0, w_orig-1)
-                radar_map[pts_y, pts_x, 0] = depth
-                radar_map[pts_y, pts_x, 1] = rcs if rcs is not None else 0.0
-        
-        radar_map = cv2.resize(radar_map, self.input_shape, interpolation=cv2.INTER_NEAREST)
-
-        # --- 4. TARGETS ---
-        # Get 3D boxes, project to 2D
-        _, boxes, _ = self.nusc.get_sample_data(cam_token, box_vis_level=0)
-        gt_boxes_2d = []
-        gt_classes = []
-        
-        for box in boxes:
-            # Simplified Logic: Map class string to ID
-            # Project 3D box corners to 2D -> Get bounding box of corners
-            # Skip logic for brevity: Assume `box_2d` is calculated [x,y,w,h]
-            # This requires view_points logic similar to points above
-            pass 
+            # 1. Load Data
+            img = cv2.cvtColor(cv2.imread(f"{self.data_root}/images/{token}.jpg"), cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
+            lid = np.load(f"{self.data_root}/lidar/{token}.npz")['data']
+            rad = np.load(f"{self.data_root}/radar/{token}.npz")['data']
+            lbl = np.load(f"{self.data_root}/labels/{token}.npz")
             
-        # Placeholder Targets (since full Anchor Matching code is huge)
-        # Returning zeros for structure validation
-        num_anchors = 277065
-        y_cls = np.zeros((num_anchors, 10), dtype=np.float32)
-        y_box = np.zeros((num_anchors, 4), dtype=np.float32)
+            boxes = lbl['boxes'] # [cx, cy, w, h]
+            classes = lbl['classes']
+            
+            # --- DATA AUGMENTATION: RANDOM FLIP (50% probability) ---
+            # Only apply this during training (split='train')
+            # If validating, leave data as is.
+            if hasattr(self, 'split') and self.split == 'train' and np.random.rand() > 0.5:
+                # 1. Flip Images (Horizontal Flip)
+                # axis=1 represents the horizontal axis (width)
+                img = np.flip(img, axis=1)
+                lid = np.flip(lid, axis=1)
+                rad = np.flip(rad, axis=1)
+                
+                # 2. Flip Boxes (Ground Truth)
+                # The X coordinate changes: new_x = image_width - old_x
+                # Image width is 320 pixels
+                if len(boxes) > 0:
+                    boxes[:, 0] = 320.0 - boxes[:, 0]
+            
+            # --- END AUGMENTATION ---
 
-        return (img_resized.astype(np.float32), 
-                lidar_map.astype(np.float32), 
-                radar_map.astype(np.float32)), (y_cls, y_box)
+            # Encode Anchors (Must be done AFTER flipping, using the transformed boxes)
+            yc, yb = self.encoder.encode(boxes, classes)
+            
+            X_img.append(img); X_lid.append(lid); X_rad.append(rad)
+            Y_cls.append(yc); Y_box.append(yb)
 
-def create_tf_dataset(nusc_root, batch_size=2, input_shape=(320, 320)):
-    """
-    Creates a tf.data.Dataset ready for model.fit() or custom training loops.
-    """
-    generator = NuScenesGenerator(nusc_root, input_shape=input_shape)
-    
-    def gen():
-        for i in range(len(generator)):
-            yield generator[i]
-
-    # Define output signature
-    # Inputs: (Img, Lidar, Radar)
-    # Outputs: (Cls_Targets, Box_Targets)
-    output_signature = (
-        (
-            tf.TensorSpec(shape=input_shape+(3,), dtype=tf.float32),
-            tf.TensorSpec(shape=input_shape+(2,), dtype=tf.float32),
-            tf.TensorSpec(shape=input_shape+(2,), dtype=tf.float32)
-        ),
-        (
-            tf.TensorSpec(shape=(277065, 10), dtype=tf.float32),
-            tf.TensorSpec(shape=(277065, 4), dtype=tf.float32)
-        )
-    )
-
-    dataset = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
-    dataset = dataset.batch(batch_size)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    
-    return dataset
-
-# USAGE
-if __name__ == "__main__":
-    # Change this to your NuScenes Mini root
-    NUSC_ROOT = "/mnt/c/Users/USUARIO/Desktop/datasets/nuscenes/v1.0-mini"
-    
-    try:
-        ds = create_tf_dataset(NUSC_ROOT, batch_size=1)
-        print("DataLoader created successfully.")
-        
-        for (img, lid, rad), (y_c, y_b) in ds.take(1):
-            print(f"Image Batch: {img.shape}")
-            print(f"LiDAR Batch: {lid.shape}")
-            print(f"Radar Batch: {rad.shape}")
-            print(f"Targets: {y_c.shape}, {y_b.shape}")
-            break
-    except Exception as e:
-        print(f"NuScenes Error: {e}")
-        print("Please ensure 'nuscenes-devkit' is installed and path is correct.")
+        return (np.array(X_img), np.array(X_lid), np.array(X_rad)), (np.array(Y_cls), np.array(Y_box))

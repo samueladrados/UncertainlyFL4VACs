@@ -227,10 +227,9 @@ def build_conv3_block(x, name='conv3'):
 # ==============================================================================
 
 class CLR_BNN(tf.keras.Model):
-    def __init__(self, num_classes=10, num_anchors=9, input_shape=(320, 320)):
+    def __init__(self, num_classes=14, num_anchors=9):
         super(CLR_BNN, self).__init__()
-        self.num_classes = num_classes
-        self.num_anchors = num_anchors
+        self.num_classes = num_classes    
         
          # --- Heads / Subnets ---
         
@@ -243,8 +242,7 @@ class CLR_BNN(tf.keras.Model):
         self.event_size = 4 * num_anchors
         params_size = tfpl.MultivariateNormalTriL.params_size(self.event_size) 
         
-        # A. Parte Numérica (Red Neuronal) - Devuelve TENSOR
-        # Usamos Sequential aquí porque todo lo que entra y sale son tensores
+        # Regression Subnet
         self.regression_net = tf.keras.Sequential([
             bayesian_conv2d(256, 3, name='reg_conv1'),
             bayesian_conv2d(256, 3, name='reg_conv2'),
@@ -275,9 +273,9 @@ class CLR_BNN(tf.keras.Model):
         ])
 
         # This creates the static graph for Backbone + FPN + Fusion
-        self.feature_extractor = self._build_feature_extractor(input_shape)
+        self.feature_extractor = self._build_feature_extractor()
 
-    def _build_feature_extractor(self, input_shape):
+    def _build_feature_extractor(self, input_shape = (320, 320)):
         """
         Builds the Feature Extractor with Sensor Fusion (Fig. 1).
         Ref: Figure 3 "Concatenation of camera image, LiDAR and RADAR".

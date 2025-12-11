@@ -5,6 +5,15 @@ from tensorflow.keras import mixed_precision
 from tqdm import tqdm
 import numpy as np
 from clr_bnn import CLR_BNN
+from data_loader import DataLoaderGenerator
+from metrics import ValidationCallback
+import os
+
+DATA_ROOT = "/mnt/c/Users/USUARIO/Desktop/enviroments/Paper_NOUS/datasets/nuscenes_preprocessed"
+BATCH_SIZE = 8 
+EPOCHS = 30
+LR = 1e-4
+NUM_CLASSES = 14
 
 tfd = tfp.distributions
 
@@ -170,7 +179,7 @@ class CLR_BNN_Trainer:
         
         return {"loss": loss, "cls": l_c, "box": l_b, "kl": l_kl}
 
-    def fit(self, dataset, epochs=1):
+    def fit(self, train_ds, val_ds, epochs=1):
         """
         Main Training Loop with Progress Bar.
         """
@@ -182,66 +191,57 @@ class CLR_BNN_Trainer:
             self.tracker_cls.reset_states()
             self.tracker_box.reset_states()
             self.tracker_kl.reset_states()
+            self.tracker_val_loss.reset_states()
             
-            # Progress bar for the dataset
-            # 'desc' shows the metrics updating in real-time
-            pbar = tqdm(dataset, unit="batch")
+            # --- TRAINING ---
+            pbar = tqdm(train_ds, unit="batch")
             
-            for step, (inputs, targets) in enumerate(pbar):
-                img, lid, rad = inputs
-                y_c, y_b = targets
-                
-                logs = self.train_step(img, lid, rad, y_c, y_b)
-                
-                # Update progress bar description with current mean loss
+            for inputs, targets in pbar:
+                self.train_step(inputs, targets)
                 pbar.set_postfix({
-                    "Loss": f"{self.tracker_loss.result():.4f}",
-                    "Cls": f"{self.tracker_cls.result():.4f}",
-                    "Box": f"{self.tracker_box.result():.4f}",
-                    "KL": f"{self.tracker_kl.result():.4f}"
+                    "L": f"{self.tracker_loss.result():.2f}",
+                    "C": f"{self.tracker_cls.result():.2f}",
+                    "B": f"{self.tracker_box.result():.2f}",
+                    "KL": f"{self.tracker_kl.result():.2f}"
                 })
-
+                            
+                # --- VALIDATION ---
+                print("Running Validation...")
+                for i, (inputs, targets) in enumerate(val_ds):
+                    self.val_step(inputs, targets)
+                    if i >= 50: break
+                    
+                print(f"End of Epoch {epoch+1} -> Train Loss: {self.tracker_loss.result():.4f} | Val Loss: {self.tracker_val_loss.result():.4f}")
+                
+                # Guardar pesos
+                os.makedirs("checkpoints", exist_ok=True)
+                self.model.save_weights(f"checkpoints/clr_bnn_epoch_{epoch+1}.h5")
             # End of Epoch Summary
             print(f"End of Epoch {epoch+1}: Total Loss: {self.tracker_loss.result():.4f}")    
 
 
-# ==============================================================================
-# DATA SIMULATION FOR TESTING
-# ==============================================================================
-def create_dummy_dataset(num_batches=50, batch_size=2):
-    """Generates a fake tf.data.Dataset to simulate training flow."""
-    
-    # 1. Create one batch of fake data
-    img = tf.random.normal((batch_size, 320, 320, 3))
-    lid = tf.random.normal((batch_size, 320, 320, 2))
-    rad = tf.zeros((batch_size, 320, 320, 2))
-    
-    # Anchors for 320x320 -> 76725
-    y_cls = tf.zeros((batch_size, 76725, 10))
-    y_box = tf.zeros((batch_size, 76725, 4))
-    
-    # 2. Repeat this batch 'num_batches' times
-    inputs = (img, lid, rad)
-    targets = (y_cls, y_box)
-    
-    dataset = tf.data.Dataset.from_tensors((inputs, targets)).repeat(num_batches)
-    return dataset
-
-
 if __name__ == "__main__":
-    print("Initializing Model (320x320)...")
+    print("Loading Datasets...")
+    train_gen = DataLoaderGenerator(DATA_ROOT, batch_size=BATCH_SIZE, split='train')
+    val_gen = DataLoaderGenerator(DATA_ROOT, batch_size=BATCH_SIZE, split='val')
+    print(f"   Train Batches: {len(train_gen)} | Val Batches: {len(val_gen)}")
     
-    model = CLR_BNN(num_classes=10, input_shape=(320, 320))
-    trainer = CLR_BNN_Trainer(model, initial_lr=1e-5, train_dataset_size=100) # Low LR for stability
+    print("Initializing Bayesian Model and Trainer...")
+    model = CLR_BNN(num_classes=NUM_CLASSES)
+    dummy_in = [tf.zeros((1, 320, 320, 3)), tf.zeros((1, 320, 320, 2)), tf.zeros((1, 320, 320, 2))]
+    model(dummy_in)
     
-    print("Creating Simulated Dataset (50 batches)...")
-    # Simulate a dataset with 50 batches of size 2
-    dummy_ds = create_dummy_dataset(num_batches=50, batch_size=2)
+    trainer = CLR_BNN_Trainer(
+        model, 
+        num_classes=NUM_CLASSES, 
+        initial_lr=LR, 
+        steps_per_epoch=len(train_gen),
+        train_dataset_size=len(train_gen) * BATCH_SIZE
+    )
     
     print("Starting Training Loop...")
-    # Train for 3 epochs
     try:
-        trainer.fit(dummy_ds, epochs=3)
+        trainer.fit(train_gen, val_gen, epochs=EPOCHS)
         print("\nTraining Finished Successfully!")
     except Exception as e:
         print(f"\nCRITICAL ERROR: {e}")
