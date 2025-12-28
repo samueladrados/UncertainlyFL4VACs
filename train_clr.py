@@ -1,19 +1,21 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
 import tensorflow_addons as tfa 
-from tensorflow.keras import mixed_precision
 from tqdm import tqdm
 import numpy as np
 from clr_bnn import CLR_BNN
-from data_loader import DataLoaderGenerator
-from metrics import ValidationCallback
+from dataloader import DataLoaderGenerator
 import os
+import json
+from tensorflow.keras import mixed_precision
+META_DIR = "./fl_meta_temp"
 
 DATA_ROOT = "/mnt/c/Users/USUARIO/Desktop/enviroments/Paper_NOUS/datasets/nuscenes_preprocessed"
-BATCH_SIZE = 8 
-EPOCHS = 30
-LR = 1e-4
+BATCH_SIZE = 1 
+EPOCHS = 1
+LR = 1e-3
 NUM_CLASSES = 14
+NUM_ANCHORS = 9
 
 tfd = tfp.distributions
 
@@ -21,7 +23,7 @@ class CLR_BNN_Trainer:
     """
     Trainer class encapsulating the training logic for CLR-BNN.
     """
-    def __init__(self, model, num_classes=10, initial_lr=1e-5, steps_per_epoch=1000, train_dataset_size=None):
+    def __init__(self, model, num_classes=14, num_anchors=9, initial_lr=0.002, steps_per_epoch=1000, epochs=1, current_round=0, train_dataset_size=None):
         """
         Initializes the trainer.
         
@@ -33,9 +35,18 @@ class CLR_BNN_Trainer:
         """
         self.model = model
         self.num_classes = num_classes
+        self.num_anchors = num_anchors
+        self.grid_sizes = [80, 40, 20, 10, 5]
+        self.current_round = current_round
+        self.train_dataset_size = train_dataset_size
         
         if train_dataset_size is not None and train_dataset_size > 0:
-            self.kl_weight = 1.0 / float(train_dataset_size)
+            target_kl_weight = 1.0 / float(train_dataset_size)
+            if current_round < 5: 
+                self.kl_weight = 0.0
+            else:
+                progress = min(1.0, (current_round - 5) / 15.0)
+                self.kl_weight = target_kl_weight * progress
             print(f"✅ KL Weight ajustado automáticamente: {self.kl_weight:.6f} (1/{train_dataset_size})")
         else:
             # Fallback seguro si no sabemos el tamaño
@@ -48,39 +59,42 @@ class CLR_BNN_Trainer:
         self.tracker_cls = tf.keras.metrics.Mean(name="cls_loss")
         self.tracker_box = tf.keras.metrics.Mean(name="box_loss")
         self.tracker_kl = tf.keras.metrics.Mean(name="kl_loss")
+        self.tracker_val_loss = tf.keras.metrics.Mean(name="val_loss")
         
         # --- OPTIMIZER SETUP ---
         # Ref: Table I "Optimizer and learning rate"
         self.lr_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
             initial_learning_rate=initial_lr,
-            decay_steps=steps_per_epoch * 80, 
-            end_learning_rate=1e-6,
-            power=0.5
+            decay_steps=max(1, (steps_per_epoch * epochs)), 
+            end_learning_rate=1e-5,
+            power=1.0
         )
         
-        base_optimizer = tfa.optimizers.LAMB(
+        self.optimizer = tfa.optimizers.LAMB(
             learning_rate=self.lr_schedule,
             clipnorm=0.5
         )
-        
-        self.optimizer = mixed_precision.LossScaleOptimizer(base_optimizer)
+        self.optimizer = mixed_precision.LossScaleOptimizer(self.optimizer)
         
         self.cls_loss_fn = tf.keras.losses.BinaryFocalCrossentropy(
-            gamma=2.0, alpha=0.25, from_logits=False, reduction=tf.keras.losses.Reduction.NONE
+            gamma=2.0,
+            alpha=0.25,
+            from_logits=True,
+            reduction=tf.keras.losses.Reduction.NONE
         )
 
-    def split_targets_by_level(self, y_true, grid_sizes):
+    def split_targets_by_level(self, y_true):
         """
         Splits ground truth tensors to match the pyramid levels.
         
         Args:
             y_true (tf.Tensor): Concatenated ground truth tensor (Batch, Total_Anchors, K).
-            grid_sizes (list): List of grid dimensions [152, 76, ...].
+            grid_sizes (list): List of grid dimensions.
             
         Returns:
             list[tf.Tensor]: List of ground truth tensors for each level.
         """
-        split_sizes = [ (g**2) * 9 for g in grid_sizes ]
+        split_sizes = [ (g**2) * 9 for g in self.grid_sizes]
         return tf.split(y_true, split_sizes, axis=1)
 
     def compute_loss(self, y_true_cls, y_true_box, cls_outputs, box_outputs):
@@ -96,21 +110,22 @@ class CLR_BNN_Trainer:
         Returns:
             tuple: (total_loss, cls_loss, box_loss, kl_loss).
         """
-        grid_sizes = [80, 40, 20, 10, 5] 
-        targets_cls_levels = self.split_targets_by_level(y_true_cls, grid_sizes)
-        targets_box_levels = self.split_targets_by_level(y_true_box, grid_sizes)
+        cls_outputs = [tf.cast(c, tf.float32) for c in cls_outputs]
         
-        total_cls_loss = 0.0
-        total_box_loss = 0.0
+        targets_cls_levels = self.split_targets_by_level(y_true_cls)
+        targets_box_levels = self.split_targets_by_level(y_true_box)
         
-        for i in range(len(grid_sizes)):
+        total_cls_loss = tf.constant(0.0, dtype=tf.float32)
+        total_box_loss = tf.constant(0.0, dtype=tf.float32)
+        
+        for i in range(len(self.grid_sizes)):
             y_cls = targets_cls_levels[i]
             y_box = targets_box_levels[i]
             pred_cls = cls_outputs[i]
             pred_dist = box_outputs[i] 
             
             # --- 1. CLASSIFICATION ---
-            pred_cls = tf.reshape(pred_cls, tf.shape(y_cls))
+            pred_cls = tf.reshape(pred_cls, (tf.shape(y_cls)[0], -1, self.num_classes))
             positive_mask = tf.reduce_max(y_cls, axis=-1) > 0 
             positive_mask_float = tf.cast(positive_mask, dtype=tf.float32)
             num_positives = tf.reduce_sum(positive_mask_float)
@@ -120,33 +135,107 @@ class CLR_BNN_Trainer:
                 normalizer = tf.cast(tf.shape(y_cls)[1], tf.float32)
             
             curr_cls_loss = self.cls_loss_fn(y_cls, pred_cls)
-            total_cls_loss += tf.reduce_sum(curr_cls_loss) / normalizer
 
-            # --- 2. REGRESSION (NLL) ---
-            H, W = grid_sizes[i], grid_sizes[i]
-            y_box_reshaped = tf.reshape(y_box, (-1, H, W, 36))
-            y_box_reshaped = tf.cast(y_box_reshaped, tf.float32)
+            loss_sum = tf.reduce_sum(curr_cls_loss)
+            total_cls_loss += tf.cast(loss_sum, tf.float32) / normalizer       
+           
+           # --- 2. REGRESSION (Robust NLL with Smooth L1) ---
+            H, W = self.grid_sizes[i], self.grid_sizes[i]
             
-            if num_positives > 0:
-                nll_spatial = -pred_dist.log_prob(y_box_reshaped)
-                nll_flat = tf.reshape(nll_spatial, (-1, H * W))
-                
-                pos_mask_reshaped = tf.reshape(positive_mask, (-1, H * W, 9))
-                pos_mask_cell = tf.reduce_any(pos_mask_reshaped, axis=-1)
-                pos_mask_cell_float = tf.cast(pos_mask_cell, dtype=tf.float32)
-                
-                nll_safe = tf.where(tf.math.is_finite(nll_flat), nll_flat, tf.zeros_like(nll_flat))
-                
-                curr_box_loss = tf.reduce_sum(nll_safe * pos_mask_cell_float)
-                total_box_loss += curr_box_loss / normalizer
+            # Ground Truth
+            # Flatten to (-1, 4) to operate coordinate-by-coordinate
+            # Note: 36 channels = 9 anchors * 4 coordinates
+            y_box_flat = tf.reshape(y_box, (-1, 4)) 
 
-        raw_kl = tf.cast(tf.reduce_sum(self.model.losses), tf.float32)
-        kl_loss = raw_kl * self.kl_weight
-        total_loss = total_cls_loss + total_box_loss + kl_loss
-        return total_loss, total_cls_loss, total_box_loss, kl_loss
+            # Predictions (Extract Mean and StdDev from the Distribution object)
+            pred_mu = pred_dist.mean()      
+            pred_std = pred_dist.stddev()   
+            
+            pred_mu_flat = tf.reshape(pred_mu, (-1, 4))
+            pred_std_flat = tf.reshape(pred_std, (-1, 4))
+
+            # --- STABILITY CLIP ---
+            # Prevents sigma from approaching zero (division by zero) or exploding.
+            # 1e-3 is a safe lower bound for float32 numerical stability.
+            pred_std_flat = tf.clip_by_value(pred_std_flat, 1e-2, 10.0)
+
+            # 1. Calculate Robust Localization Error (Smooth L1 / Huber)
+            diff = tf.abs(y_box_flat - pred_mu_flat)
+            # Smooth L1 logic: 0.5 * x^2 if x < 1, else |x| - 0.5
+            smooth_l1 = tf.where(diff < 1.0, 0.5 * tf.square(diff), diff - 0.5)
+
+            # 2. Calculate Variance (sigma^2) and Log Variance
+            sigma2 = tf.square(pred_std_flat) + 1e-6
+            log_sigma2 = tf.math.log(sigma2)
+            inv_sigma2 = tf.clip_by_value(1.0 / sigma2, 0.0, 500.0)
+            
+            # 3. Attenuated Loss Calculation (Ref: Kendall & Gal)
+            # Loss = (SmoothL1 / Variance) + 0.5 * Log(Variance)
+            # Term 1: Attenuates error based on uncertainty
+            # Term 2: Penalty for high uncertainty (Regularization)
+            term_error = smooth_l1 * inv_sigma2
+            term_reg = 0.5 * log_sigma2
+            
+            nll_item = term_error + term_reg
+            
+            # Sum the 4 values (tx, ty, tw, th) to get the total loss per anchor
+            nll_flat = tf.reduce_sum(nll_item, axis=-1) # Shape: (Total_Anchors,)
+
+            # --- MASKING ---
+            # Flatten the positive mask to match the anchors
+            pos_mask_flat = tf.reshape(positive_mask, (-1,))
+            pos_mask_float = tf.cast(pos_mask_flat, dtype=tf.float32)
+
+            # Safety Check: Filter out potential NaNs or Infs
+            nll_safe = tf.where(tf.math.is_finite(nll_flat), nll_flat, tf.zeros_like(nll_flat))
+            
+            # Only sum loss for positive anchors (those containing an object)
+            curr_box_loss = tf.reduce_sum(nll_safe * pos_mask_float)
+            
+            # Add to total box loss normalized by the number of positives
+            total_box_loss += tf.cast(curr_box_loss, tf.float32) / normalizer
+            
+        data_loss = total_cls_loss + total_box_loss
+        raw_losses = self.model.losses
+        safe_losses = []
+        for l in raw_losses:
+            l_32 = tf.cast(l, tf.float32)
+            safe_l = tf.where(tf.math.is_finite(l_32), l_32, tf.zeros_like(l_32))
+            safe_losses.append(safe_l)
+        raw_kl_sum = tf.reduce_sum(safe_losses)
+        kl_loss = raw_kl_sum * self.kl_weight
+
+        # tf.print(raw_kl, kl_loss)
+        
+        # # 1. Extraer todas las capas que tienen KL (incluyendo Sequential)
+        # all_bayesian_layers = []
+        # for layer in self.model.layers:
+        #     if isinstance(layer, tf.keras.Sequential):
+        #         # Extraemos las sub-capas de las heads de regresión y clasificación
+        #         all_bayesian_layers.extend([sub for sub in layer.layers if hasattr(sub, 'losses') and sub.losses])
+        #     elif hasattr(layer, 'losses') and layer.losses:
+        #         all_bayesian_layers.append(layer)
+
+        # # --- FORMA CORRECTA PARA TF.FUNCTION ---
+        # tf.print("📊 DESGLOSE DE KL - BATCH TOTAL:", kl_loss)
+        # for layer in self.model._flatten_layers():
+        #     if hasattr(layer, 'losses') and layer.losses:
+        #         layer_kl = tf.reduce_sum(layer.losses) * self.kl_weight
+        #         if layer_kl > 0:
+        #             tf.print("Layer:", f"{layer.name:<30}", "| KL:", layer_kl)
+
+        # tf.print("=" * 50 + "\n")
+        
+        total_loss = data_loss + kl_loss
+        total_loss = tf.where(tf.math.is_finite(total_loss), total_loss, tf.constant(0.0, dtype=tf.float32))
+        
+        return (tf.cast(total_loss, tf.float32), 
+                tf.cast(total_cls_loss, tf.float32), 
+                tf.cast(total_box_loss, tf.float32), 
+                tf.cast(kl_loss, tf.float32))
 
     @tf.function
-    def train_step(self, images, lidar, radar, target_cls, target_box):
+    def train_step(self, inputs, targets):
         """
         Runs a single training step.
         
@@ -160,14 +249,16 @@ class CLR_BNN_Trainer:
         Returns:
             dict: Loss metrics for the step.
         """
+        images, lidar, radar = inputs
+        target_cls, target_box = targets
+        
         with tf.GradientTape() as tape:
             cls_outs, box_outs = self.model([images, lidar, radar], training=True)
             loss, l_c, l_b, l_kl = self.compute_loss(target_cls, target_box, cls_outs, box_outs)
             scaled_loss = self.optimizer.get_scaled_loss(loss)
         
-        scaled_grads = tape.gradient(scaled_loss, self.model.trainable_variables)
-        grads = self.optimizer.get_unscaled_gradients(scaled_grads)
-        
+        scaled_gradients = tape.gradient(scaled_loss, self.model.trainable_variables) 
+        grads = self.optimizer.get_unscaled_gradients(scaled_gradients)
         grads_ok = [tf.where(tf.math.is_nan(g), tf.zeros_like(g), g) if g is not None else g for g in grads]
         self.optimizer.apply_gradients(zip(grads_ok, self.model.trainable_variables))
         
@@ -179,13 +270,29 @@ class CLR_BNN_Trainer:
         
         return {"loss": loss, "cls": l_c, "box": l_b, "kl": l_kl}
 
-    def fit(self, train_ds, val_ds, epochs=1):
+    @tf.function
+    def val_step(self, inputs, targets):
+        img, lid, rad = inputs
+        y_c, y_b = targets
+        
+        # Training=False uses Mean weights (Deterministic)
+        cls_outs, box_outs = self.model([img, lid, rad], training=False)
+        loss, _, _, _ = self.compute_loss(y_c, y_b, cls_outs, box_outs)
+        self.tracker_val_loss.update_state(loss)
+        return loss
+
+    def fit(self, train_ds, val_ds, epochs=1, callbacks=None):
         """
         Main Training Loop with Progress Bar.
+        Arguments:
+            train_ds: Training dataset/generator
+            val_ds: Validation dataset/generator (Can be None for FL clients)
+            epochs: Number of epochs
         """
+        callbacks = callbacks or []
+        
         for epoch in range(epochs):
-            print(f"\nEpoch {epoch+1}/{epochs}")
-            
+  
             # Reset metrics at start of epoch
             self.tracker_loss.reset_states()
             self.tracker_cls.reset_states()
@@ -194,9 +301,13 @@ class CLR_BNN_Trainer:
             self.tracker_val_loss.reset_states()
             
             # --- TRAINING ---
-            pbar = tqdm(train_ds, unit="batch")
+            pbar = tqdm(train_ds, desc=f"   Epoch {epoch+1}", unit="batch", leave=False)
             
-            for inputs, targets in pbar:
+            for batch_idx, (inputs, targets) in enumerate(pbar):
+                current_batch_size = inputs[0].shape[0]
+                if current_batch_size == 0:
+                    print(f"⚠️ Skipping empty batch {batch_idx}, Image shape: {inputs[0].shape[0]}, Lidar shape: {inputs[1].shape[0]}, Radar shape: {inputs[2].shape[0]}")
+                    continue
                 self.train_step(inputs, targets)
                 pbar.set_postfix({
                     "L": f"{self.tracker_loss.result():.2f}",
@@ -205,25 +316,48 @@ class CLR_BNN_Trainer:
                     "KL": f"{self.tracker_kl.result():.2f}"
                 })
                             
-                # --- VALIDATION ---
-                print("Running Validation...")
+            # --- VALIDATION ---
+            if val_ds is not None:
+                # Run validation only if dataset provided
                 for i, (inputs, targets) in enumerate(val_ds):
                     self.val_step(inputs, targets)
-                    if i >= 50: break
-                    
-                print(f"End of Epoch {epoch+1} -> Train Loss: {self.tracker_loss.result():.4f} | Val Loss: {self.tracker_val_loss.result():.4f}")
+                    if i >= 20: break # Speed limit for validation
+            
                 
-                # Guardar pesos
-                os.makedirs("checkpoints", exist_ok=True)
-                self.model.save_weights(f"checkpoints/clr_bnn_epoch_{epoch+1}.h5")
-            # End of Epoch Summary
-            print(f"End of Epoch {epoch+1}: Total Loss: {self.tracker_loss.result():.4f}")    
+                print(f"      End Epoch {epoch+1} -> Train Loss: {self.tracker_loss.result():.4f} | Val Loss: {self.tracker_val_loss.result():.4f}")
+                
+            else:
+                # If no validation, just print Train Loss
+                print(f"      End Epoch {epoch+1} -> Train Loss: {self.tracker_loss.result():.4f} | L: {self.tracker_loss.result():.2f}, C: {self.tracker_cls.result():.2f}, B: {self.tracker_box.result():.2f}, KL: {self.tracker_kl.result():.2f}") 
+
+                logs = {
+                    'loss': float(self.tracker_loss.result()),
+                    'cls_loss': float(self.tracker_cls.result()),
+                    'box_loss': float(self.tracker_box.result()),
+                    'kl_loss': float(self.tracker_kl.result()),
+                    'val_loss': float(self.tracker_val_loss.result()) if val_ds else 0.0
+                }
+                for callback in callbacks:
+                    callback.on_epoch_end(epoch, logs)
 
 
 if __name__ == "__main__":
+    manifest_path=os.path.join(META_DIR, f"client_0_manifest.json")
+    with open(manifest_path, 'r') as f:
+        my_files = json.load(f)
+        
     print("Loading Datasets...")
-    train_gen = DataLoaderGenerator(DATA_ROOT, batch_size=BATCH_SIZE, split='train')
-    val_gen = DataLoaderGenerator(DATA_ROOT, batch_size=BATCH_SIZE, split='val')
+    train_gen = DataLoaderGenerator(
+        data_root=DATA_ROOT, 
+        specific_files=my_files['train'], 
+        batch_size=BATCH_SIZE
+    )
+    
+    val_gen = DataLoaderGenerator(
+        data_root=DATA_ROOT, 
+        specific_files=my_files['val'], 
+        batch_size=BATCH_SIZE
+    )
     print(f"   Train Batches: {len(train_gen)} | Val Batches: {len(val_gen)}")
     
     print("Initializing Bayesian Model and Trainer...")

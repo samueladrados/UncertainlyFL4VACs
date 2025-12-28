@@ -38,19 +38,10 @@ def map_pointcloud_to_image(nusc, pointsensor_token, camera_token, min_dist=1.0)
     # Robust Detection (Check channel name or file extension to avoid .pcd vs .bin crash)
     is_lidar = 'LIDAR' in pointsensor_data['channel'] or pcl_path.endswith('.bin')
     
-    try:
-        if is_lidar:
-            # Try loading sweeps for LiDAR (denser cloud, 10 sweeps ~0.5s)
-            pc, _ = LidarPointCloud.from_file_multisweep(nusc, nusc.get('sample', pointsensor_data['sample_token']), 
-                                                         pointsensor_data['channel'], pointsensor_data['channel'], nsweeps=10)
-        else:
-            # Try loading sweeps for Radar (5 sweeps ~0.4s to avoid blurring)
-            pc, _ = RadarPointCloud.from_file_multisweep(nusc, nusc.get('sample', pointsensor_data['sample_token']), 
-                                                         pointsensor_data['channel'], pointsensor_data['channel'], nsweeps=5)
-    except:
-        # Fallback if sweeps folder is missing (e.g., partial dataset download)
-        if is_lidar: pc = LidarPointCloud.from_file(pcl_path)
-        else: pc = RadarPointCloud.from_file(pcl_path)
+    if is_lidar:
+        pc = LidarPointCloud.from_file(pcl_path)
+    else:
+        pc = RadarPointCloud.from_file(pcl_path)
 
     # Feature Extraction (Before rotation)
     extra_feature = None

@@ -49,7 +49,6 @@ if gpus:
 tfd = tfp.distributions
 tfpl = tfp.layers
 tfm = tfp.math
-
 # ==============================================================================
 # 1. BAYESIAN CONFIGURATION & UTILS
 # Ref: Section II-B "Layers and Initialization"
@@ -80,11 +79,34 @@ def get_prior_bias_posterior_fn(init_value=-4.59):
             # Fix 1: Center distribution at low probability
             loc_initializer=tf.constant_initializer(init_value),
             # Fix 2: Freeze variance initially so it acts deterministically
-            untransformed_scale_initializer=tf.constant_initializer(-5.0)
+            untransformed_scale_initializer=tf.constant_initializer(-11.5)
         )(dtype, shape, name, trainable, add_variable_fn)
     return posterior_fn
 
 
+def get_default_prior_and_posterior_fn(dtype, shape, name, trainable, add_variable_fn):
+    """
+    Standard posterior for weights. 
+    It already accepts the 5 required arguments.
+    """
+    return tfpl.default_mean_field_normal_fn(
+        is_singular=False,
+        loc_initializer=tf.zeros_initializer(), # Mean = 0
+        untransformed_scale_initializer=tf.constant_initializer(-11.5) # Dirac Delta
+    )(dtype, shape, name, trainable, add_variable_fn)
+
+def get_posterior_weights_fn(dtype, shape, name, trainable, add_variable_fn):
+    """
+    Posterior initialization with RANDOM weights (He Normal).
+    Critical to break symmetry and allow learning.
+    """
+    return tfpl.default_mean_field_normal_fn(
+        is_singular=False,
+        # Usamos HeNormal (o Glorot) para que los pesos sean distintos al inicio
+        loc_initializer=tf.keras.initializers.HeNormal(), 
+        # Mantenemos varianza baja inicial para estabilidad
+        untransformed_scale_initializer=tf.constant_initializer(-11.5) 
+    )(dtype, shape, name, trainable, add_variable_fn)
 
 def bayesian_conv2d(filters, kernel_size, strides=1, padding='same', activation='relu', name=None):
     """
@@ -95,6 +117,7 @@ def bayesian_conv2d(filters, kernel_size, strides=1, padding='same', activation=
     - Posterior: Mean Field Normal (trainable parameters).
     - Initialization: Based on ImageNet for feature extraction layers.
     """
+    
     return tfpl.Convolution2DReparameterization(
         filters=filters,
         kernel_size=kernel_size,
@@ -102,9 +125,12 @@ def bayesian_conv2d(filters, kernel_size, strides=1, padding='same', activation=
         padding=padding,
         activation=activation,
         name=name,
-        kernel_prior_fn=tfpl.default_multivariate_normal_fn,
-        kernel_posterior_fn=tfpl.default_mean_field_normal_fn(is_singular=False),
-        kernel_divergence_fn=get_kernel_divergence_fn()
+        kernel_prior_fn=get_default_prior_and_posterior_fn,
+        kernel_posterior_fn=get_posterior_weights_fn,
+        bias_prior_fn=get_default_prior_and_posterior_fn,
+        bias_posterior_fn=get_default_prior_and_posterior_fn,
+        kernel_divergence_fn=get_kernel_divergence_fn(),
+        dtype=tf.float16
     )
 
 # ==============================================================================
@@ -139,10 +165,11 @@ class MinIZPooling2D(tf.keras.layers.Layer):
             Contains the minimum NON-ZERO value in each pooling window.
         """
         # 1. Detect zeros (missing data)
-        zeros_mask = tf.equal(inputs, 0.0)
+        dtype = self.compute_dtype
+        zeros_mask = tf.equal(inputs, tf.cast(0.0, dtype))
         
         # 2. Replace zeros with Infinity
-        large_val = 1e5
+        large_val = tf.cast(1e5, dtype)
         inputs_shifted = tf.where(zeros_mask, large_val, inputs)
         
         # 3. Math trick: Min(x) = -Max(-x)
@@ -152,15 +179,15 @@ class MinIZPooling2D(tf.keras.layers.Layer):
         min_pool = -max_pool_neg
         
         # 4. Restore zeros if window was empty
-        safe_threshold = large_val / 2.0
-        return tf.where(min_pool > safe_threshold, 0.0, min_pool)
+        safe_threshold = tf.cast(5e4, dtype)
+        return tf.where(min_pool > safe_threshold, tf.cast(0.0, dtype), min_pool)
 
 # ==============================================================================
 # 3. SPECIFIC ARCHITECTURE BLOCKS
 # Ref: Table I "CLR-DNN AND CLR-BNN ARCHITECTURE DETAILS"
 # ==============================================================================
 
-def bottleneck_block(x, filters, stride=1, use_projection=False):
+def bottleneck_block(x, filters, stride=1, use_projection=False, unique_name=None):
     """
     Bayesian implementation of ResNet-50 bottleneck block (Conv1-5 Blocks).
     Filters structure: [1x1, 3x3, 1x1]
@@ -169,23 +196,23 @@ def bottleneck_block(x, filters, stride=1, use_projection=False):
     shortcut = x
 
     if use_projection:
-        shortcut = bayesian_conv2d(filters3, kernel_size=1, strides=stride, padding='same')(shortcut)
-        shortcut = tf.keras.layers.BatchNormalization()(shortcut)
+        shortcut = bayesian_conv2d(filters3, kernel_size=1, strides=stride, activation=None, padding='valid', name=f"{unique_name}_0_conv" if unique_name else None)(shortcut)
+        shortcut = tf.keras.layers.BatchNormalization(name=f"{unique_name}_0_bn" if unique_name else None)(shortcut)
 
     # 1. Conv 1x1
-    x = bayesian_conv2d(filters1, kernel_size=1, strides=stride if stride > 1 else 1)(x)
-    x = tf.keras.layers.BatchNormalization()(x)
+    x = bayesian_conv2d(filters1, kernel_size=1, strides=stride if stride > 1 else 1, padding='valid', name=f"{unique_name}_1_conv" if unique_name else None)(x)
+    x = tf.keras.layers.BatchNormalization(name=f"{unique_name}_1_bn" if unique_name else None)(x)
     
     # 2. Conv 3x3
-    x = bayesian_conv2d(filters2, kernel_size=3)(x)
-    x = tf.keras.layers.BatchNormalization()(x)
+    x = bayesian_conv2d(filters2, kernel_size=3, name=f"{unique_name}_2_conv" if unique_name else None)(x)
+    x = tf.keras.layers.BatchNormalization(name=f"{unique_name}_2_bn" if unique_name else None)(x)
 
     # 3. Conv 1x1
-    x = bayesian_conv2d(filters3, kernel_size=1)(x)
-    x = tf.keras.layers.BatchNormalization()(x)
+    x = bayesian_conv2d(filters3, kernel_size=1, padding='valid', activation=None, name=f"{unique_name}_3_conv" if unique_name else None)(x)
+    x = tf.keras.layers.BatchNormalization(name=f"{unique_name}_3_bn" if unique_name else None)(x)
 
-    x = tf.keras.layers.Add()([x, shortcut])
-    x = tf.keras.layers.ReLU()(x)
+    x = tf.keras.layers.Add(name=f"{unique_name}_add")([x, shortcut])
+    x = tf.keras.layers.ReLU(name=f"{unique_name}_out")(x)
     return x
 
 def build_conv1_block(x, name='conv1'):
@@ -193,7 +220,9 @@ def build_conv1_block(x, name='conv1'):
     Conv1 Block per Table I: 7x7, 64, stride 2
     Used for both Image and LiDAR branches.
     """
-    x = bayesian_conv2d(filters=64, kernel_size=7, strides=2, name=name)(x)
+    x = bayesian_conv2d(filters=64, kernel_size=7, strides=2, name=f"{name}_conv")(x)
+    x = tf.keras.layers.BatchNormalization(name=f"{name}_bn")(x)
+    x = tf.keras.layers.ReLU(name=f"{name}_relu")(x)
     return x
 
 def build_conv2_block(x, name='conv2'):
@@ -205,10 +234,10 @@ def build_conv2_block(x, name='conv2'):
     """
     x = tf.keras.layers.MaxPool2D(pool_size=(3, 3), strides=(2, 2), padding='same', name=f'{name}_pool')(x)
     
-    # 3 residual blocks [64, 64, 256]
-    x = bottleneck_block(x, [64, 64, 256], stride=1, use_projection=True)
-    x = bottleneck_block(x, [64, 64, 256], stride=1)
-    x = bottleneck_block(x, [64, 64, 256], stride=1)
+    # Block 1 always uses projection in ResNet to align channels (filters3=256)
+    x = bottleneck_block(x, [64, 64, 256], stride=1, use_projection=True, unique_name=f"{name}_block1")
+    x = bottleneck_block(x, [64, 64, 256], stride=1, unique_name=f"{name}_block2")
+    x = bottleneck_block(x, [64, 64, 256], stride=1, unique_name=f"{name}_block3")
     return x
 
 def build_conv3_block(x, name='conv3'):
@@ -216,9 +245,33 @@ def build_conv3_block(x, name='conv3'):
     Conv3 Block per Table I:
     3x Residual Bottleneck blocks [128, 128, 512]
     """
-    x = bottleneck_block(x, [128, 128, 512], stride=2, use_projection=True)
-    x = bottleneck_block(x, [128, 128, 512], stride=1)
-    x = bottleneck_block(x, [128, 128, 512], stride=1)
+    x = bottleneck_block(x, [128, 128, 512], stride=2, use_projection=True, unique_name=f"{name}_block1")
+    x = bottleneck_block(x, [128, 128, 512], stride=1, unique_name=f"{name}_block2")
+    x = bottleneck_block(x, [128, 128, 512], stride=1, unique_name=f"{name}_block3")
+    return x
+
+def build_conv4_block(x, name='conv4'):
+    """
+    Conv4 Block:
+    3x Residual Bottleneck blocks [256, 256, 1024]
+    Stride 2 in the first block to downsample.
+    """
+    # Block 1: Stride 2 + Projection (aligns channels to 1024)
+    x = bottleneck_block(x, [256, 256, 1024], stride=2, use_projection=True, unique_name=f"{name}_block1")
+    x = bottleneck_block(x, [256, 256, 1024], stride=1, unique_name=f"{name}_block2")
+    x = bottleneck_block(x, [256, 256, 1024], stride=1, unique_name=f"{name}_block3")
+    return x
+
+def build_conv5_block(x, name='conv5'):
+    """
+    Conv5 Block:
+    3x Residual Bottleneck blocks [512, 512, 2048]
+    Stride 2 in the first block to downsample.
+    """
+    # Block 1: Stride 2 + Projection (aligns channels to 2048)
+    x = bottleneck_block(x, [512, 512, 2048], stride=2, use_projection=True, unique_name=f"{name}_block1")
+    x = bottleneck_block(x, [512, 512, 2048], stride=1, unique_name=f"{name}_block2")
+    x = bottleneck_block(x, [512, 512, 2048], stride=1, unique_name=f"{name}_block3")
     return x
 
 # ==============================================================================
@@ -262,13 +315,15 @@ class CLR_BNN(tf.keras.Model):
                 filters=num_classes * num_anchors, 
                 kernel_size=3, 
                 padding='same', 
-                activation='sigmoid', 
+                activation=None, 
                 name='cls_final',
-                # FIX: Usamos bias_posterior_fn en lugar de bias_initializer
+                
                 bias_posterior_fn=get_prior_bias_posterior_fn(-4.59),
-                kernel_prior_fn=tfpl.default_multivariate_normal_fn,
-                kernel_posterior_fn=tfpl.default_mean_field_normal_fn(is_singular=False),
-                kernel_divergence_fn=get_kernel_divergence_fn()
+                bias_prior_fn=get_prior_bias_posterior_fn(-4.59),
+                kernel_prior_fn=get_default_prior_and_posterior_fn,
+                kernel_posterior_fn=get_posterior_weights_fn,
+                kernel_divergence_fn=get_kernel_divergence_fn(),
+                dtype=tf.float16
             )
         ])
 
@@ -282,91 +337,89 @@ class CLR_BNN(tf.keras.Model):
         """
         
         h, w = input_shape
-        input_img = tf.keras.Input(shape=(h, w, 3), name='img_input')
-        input_lidar = tf.keras.Input(shape=(h, w, 2), name='lidar_input')
-        input_radar = tf.keras.Input(shape=(h, w, 2), name='radar_input')
+        input_img = tf.keras.Input(shape=(h, w, 3), name='img_input', dtype=tf.float16)
+        input_lidar = tf.keras.Input(shape=(h, w, 2), name='lidar_input', dtype=tf.float16)
+        input_radar = tf.keras.Input(shape=(h, w, 2), name='radar_input', dtype=tf.float16)
 
         # --- 1. BACKBONE CONSTRUCTION ---
         # Parallel Branches
-        l_c1 = build_conv1_block(input_lidar, name='lidar_branch_c1')
+        l_c1 = build_conv1_block(input_lidar, name='lidar_conv1')
         r_processed = MinIZPooling2D(pool_size=(2, 2), strides=(1, 1), padding='same')(input_radar)
-        r_c1 = build_conv1_block(r_processed, name='radar_branch_c1')
+        r_c1 = build_conv1_block(r_processed, name='radar_conv1')
 
         # Stage 1
-        s1_input = tf.keras.layers.Concatenate()([input_img, input_lidar, r_processed])
-        c1 = build_conv1_block(s1_input, name='backbone_conv1')
+        s1_input = tf.keras.layers.Concatenate(name='fusion_input_c1')([input_img, input_lidar, r_processed])
+        c1 = build_conv1_block(s1_input, name='conv1')
 
         # Stage 2
-        l_c2 = build_conv2_block(l_c1, name='lidar_branch_c2')
-        r_c2 = build_conv2_block(r_c1, name='radar_branch_c2')
-        c1_fused = tf.keras.layers.Concatenate()([c1, l_c1, r_c1])
-        c2 = build_conv2_block(c1_fused, name='backbone_conv2')
+        l_c2 = build_conv2_block(l_c1, name='lidar_conv2')
+        r_c2 = build_conv2_block(r_c1, name='radar_conv2')
+        c1_fused = tf.keras.layers.Concatenate(name='fusion_output_c1')([c1, l_c1, r_c1])
+        c2 = build_conv2_block(c1_fused, name='conv2')
 
         # Stage 3
-        l_c3 = build_conv3_block(l_c2, name='lidar_branch_c3')
-        r_c3 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same')(r_c2)
-        c2_fused = tf.keras.layers.Concatenate()([c2, l_c2, r_c2])
-        c3 = build_conv3_block(c2_fused, name='backbone_conv3')
+        l_c3 = build_conv3_block(l_c2, name='lidar_conv3')
+        r_c3 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same', name='radar_c3')(r_c2)
+        c2_fused = tf.keras.layers.Concatenate(name='fusion_output_c2')([c2, l_c2, r_c2])
+        c3 = build_conv3_block(c2_fused, name='conv3')
 
         # Stage 4
-        l_c4 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same')(l_c3)
-        r_c4 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same')(r_c3)
-        c3_fused = tf.keras.layers.Concatenate()([c3, l_c3, r_c3])
-        c4 = bottleneck_block(c3_fused, [256, 256, 1024], stride=2, use_projection=True)
-        for _ in range(2): c4 = bottleneck_block(c4, [256, 256, 1024])
+        l_c4 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same', name='lidar_c4')(l_c3)
+        r_c4 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same', name='radar_c4')(r_c3)
+        c3_fused = tf.keras.layers.Concatenate(name='fusion_output_c3')([c3, l_c3, r_c3])
+        c4 = build_conv4_block(c3_fused, name='conv4')
 
         # Stage 5
-        l_c5 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same')(l_c4)
-        r_c5 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same')(r_c4)
-        c4_fused = tf.keras.layers.Concatenate()([c4, l_c4, r_c4])
-        c5 = bottleneck_block(c4_fused, [512, 512, 2044], stride=2, use_projection=True)
-        for _ in range(2): c5 = bottleneck_block(c5, [512, 512, 2044])
+        l_c5 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same', name='lidar_c5')(l_c4)
+        r_c5 = tf.keras.layers.MaxPool2D(pool_size=(2,2), strides=(2,2), padding='same', name='radar_c5')(r_c4)
+        c4_fused = tf.keras.layers.Concatenate(name='fusion_output_c4')([c4, l_c4, r_c4])
+        c5 = build_conv5_block(c4_fused, name='conv5')
 
         # Sensor Downsampling for P7
-        l_c6 = tf.keras.layers.MaxPool2D(2, strides=2, padding='same')(l_c5)
-        r_c6 = tf.keras.layers.MaxPool2D(2, strides=2, padding='same')(r_c5)
+        l_c6 = tf.keras.layers.MaxPool2D(2, strides=2, padding='same', name='lidar_c6')(l_c5)
+        r_c6 = tf.keras.layers.MaxPool2D(2, strides=2, padding='same', name='radar_c6')(r_c5)
 
         # --- 2. FPN CONSTRUCTION (Lateral Fusion) ---
         feature_size = 256
         
         # P6 (Top)
         # Fuse C5 + L5 + R5 -> Reduce -> Smooth
-        p6_input = tf.keras.layers.Concatenate()([c5, l_c5, r_c5])
+        p6_input = tf.keras.layers.Concatenate(name='p6_fusion_in')([c5, l_c5, r_c5])
         p6_lat = bayesian_conv2d(feature_size, 1, name='fpn_lat_p6')(p6_input)
-        p6_fused = tf.keras.layers.Concatenate()([p6_lat, l_c5, r_c5])
+        p6_fused = tf.keras.layers.Concatenate(name='p6_fusion_out')([p6_lat, l_c5, r_c5])
         p6_output = bayesian_conv2d(feature_size, 3, name='fpn_p6')(p6_fused)
         
         # P5 (C4)
-        p6_up = tf.keras.layers.UpSampling2D(size=(2, 2))(p6_lat)
-        p5_input = tf.keras.layers.Concatenate()([c4, l_c4, r_c4])
+        p6_up = tf.keras.layers.UpSampling2D(size=(2, 2), name='p6_upsampling')(p6_lat)
+        p5_input = tf.keras.layers.Concatenate(name='p5_fusion_in')([c4, l_c4, r_c4])
         p5_lat = bayesian_conv2d(feature_size, 1, name='fpn_lat_p5')(p5_input)
-        p6_up = tf.image.resize(p6_up, tf.shape(p5_lat)[1:3])
-        p5_sum = tf.keras.layers.Add()([p6_up, p5_lat])
-        p5_fused = tf.keras.layers.Concatenate()([p5_sum, l_c4, r_c4])
+        p6_up = tf.image.resize(p6_up, tf.shape(p5_lat)[1:3], name='p6_resize_to_p5')
+        p5_sum = tf.keras.layers.Add(name='p5_sum_latent')([p6_up, p5_lat])
+        p5_fused = tf.keras.layers.Concatenate(name='p5_fusion_out')([p5_sum, l_c4, r_c4])
         p5_output = bayesian_conv2d(feature_size, 3, name='fpn_p5')(p5_fused)
 
         # P4 (C3)
-        p5_up = tf.keras.layers.UpSampling2D(size=(2, 2))(p5_sum)
-        p4_input = tf.keras.layers.Concatenate()([c3, l_c3, r_c3])
+        p5_up = tf.keras.layers.UpSampling2D(size=(2, 2), name='p5_upsampling')(p5_sum)
+        p4_input = tf.keras.layers.Concatenate(name='p4_fusion_in')([c3, l_c3, r_c3])
         p4_lat = bayesian_conv2d(feature_size, 1, name='fpn_lat_p4')(p4_input)
-        p5_up = tf.image.resize(p5_up, tf.shape(p4_lat)[1:3])
-        p4_sum = tf.keras.layers.Add()([p5_up, p4_lat])
-        p4_fused = tf.keras.layers.Concatenate()([p4_sum, l_c3, r_c3])
+        p5_up = tf.image.resize(p5_up, tf.shape(p4_lat)[1:3], name='p5_resize_to_p4')
+        p4_sum = tf.keras.layers.Add(name='p4_sum_latent')([p5_up, p4_lat])
+        p4_fused = tf.keras.layers.Concatenate(name='p4_fusion_out')([p4_sum, l_c3, r_c3])
         p4_output = bayesian_conv2d(feature_size, 3, name='fpn_p4')(p4_fused)
 
         # P3 (C2)
-        p4_up = tf.keras.layers.UpSampling2D(size=(2, 2))(p4_sum)
-        p3_input = tf.keras.layers.Concatenate()([c2, l_c2, r_c2])
+        p4_up = tf.keras.layers.UpSampling2D(size=(2, 2), name='p4_upsampling')(p4_sum)
+        p3_input = tf.keras.layers.Concatenate(name='p3_fusion_in')([c2, l_c2, r_c2])
         p3_lat = bayesian_conv2d(feature_size, 1, name='fpn_lat_p3')(p3_input)
-        p4_up = tf.image.resize(p4_up, tf.shape(p3_lat)[1:3])
-        p3_sum = tf.keras.layers.Add()([p4_up, p3_lat])
-        p3_fused = tf.keras.layers.Concatenate()([p3_sum, l_c2, r_c2])
+        p4_up = tf.image.resize(p4_up, tf.shape(p3_lat)[1:3], name='p4_resize_to_p3')
+        p3_sum = tf.keras.layers.Add(name='p3_sum_latent')([p4_up, p3_lat])
+        p3_fused = tf.keras.layers.Concatenate(name='p3_fusion_out')([p3_sum, l_c2, r_c2])
         p3_output = bayesian_conv2d(feature_size, 3, name='fpn_p3')(p3_fused)
 
         # P7 (from P6)
-        p7_in = tf.keras.layers.ReLU()(p6_lat)
+        p7_in = tf.keras.layers.ReLU(name='p7_activation')(p6_lat)
         p7_in = bayesian_conv2d(feature_size, 3, strides=2, name='fpn_p7_in')(p7_in)
-        p7_fused = tf.keras.layers.Concatenate()([p7_in, l_c6, r_c6])
+        p7_fused = tf.keras.layers.Concatenate(name='p7_fusion_out')([p7_in, l_c6, r_c6])
         p7_output = bayesian_conv2d(feature_size, 3, name='fpn_p7')(p7_fused)
 
         features = [p3_output, p4_output, p5_output, p6_output, p7_output]
@@ -397,30 +450,35 @@ class CLR_BNN(tf.keras.Model):
         
         features = self.feature_extractor(inputs, training=training)
         
-        cls_outputs = [self.classification_head(f) for f in features]
+        # Classification
+        cls_outputs = []
+        for i, f in enumerate(features):
+            # Esto etiqueta las pérdidas internas de la cabeza para cada nivel
+            with tf.name_scope(f"p{i+3}_cls"):
+                cls_outputs.append(self.classification_head(f))
         
         box_outputs = []
-        for f in features:
-            # 1. Get Raw Distribution Parameters from Network
-            params = self.regression_net(f)
-            params = tf.cast(params, tf.float32)
-            params = tf.clip_by_value(params, -100.0, 100.0)
-            
-            # 2. Split into Mean and Covariance Parameters
-            loc = params[..., :self.event_size]
-            scale_params = params[..., self.event_size:]
-            
-            # 3. Construct Lower Triangular Matrix (Covariance)
-            scale_tril = tfm.fill_triangular(scale_params)
-            
-            # 4. Ensure positive diagonal for numerical stability
-            diag = tf.linalg.diag_part(scale_tril)
-            softplus_diag = tf.nn.softplus(diag) + 1e-5
-            scale_tril = tf.linalg.set_diag(scale_tril, softplus_diag)
-            
-            # 5. Create Distribution Object
-            dist = tfd.MultivariateNormalTriL(loc=loc, scale_tril=scale_tril)
-            box_outputs.append(dist)
+        for i, f in enumerate(features):
+            with tf.name_scope(f"p{i+3}_reg"):
+                params = self.regression_net(f)
+                params = tf.cast(params, tf.float32)
+                params = tf.clip_by_value(params, -100.0, 100.0)
+                
+                # 2. Split into Mean and Covariance Parameters
+                loc = params[..., :self.event_size]
+                scale_params = params[..., self.event_size:]
+                
+                # 3. Construct Lower Triangular Matrix (Covariance)
+                scale_tril = tfm.fill_triangular(scale_params)
+                
+                # 4. Ensure positive diagonal for numerical stability
+                diag = tf.linalg.diag_part(scale_tril)
+                softplus_diag = tf.nn.softplus(diag) + 1e-5
+                scale_tril = tf.linalg.set_diag(scale_tril, softplus_diag)
+                
+                # 5. Create Distribution Object
+                dist = tfd.MultivariateNormalTriL(loc=loc, scale_tril=scale_tril)
+                box_outputs.append(dist)
 
         # --- TRAINING: Return raw structure for ELBO Loss ---
         if training:
