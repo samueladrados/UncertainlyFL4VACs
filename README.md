@@ -58,6 +58,9 @@ UncertaintyFL4VACs/
 │   ├── 📂 evaluation/                  # Performance metrics
 │   │   └── 🐍 evaluator.py             # Inference & scoring
 │   └── 📂 utils/                       # Helpers (Logging, Callbacks)
+│       ├── 🐍 callbacks.py             # Training callbacks
+│       ├── 🐍 file_utils.py            # File system & I/O utilities
+│       └── 🐍 logger.py                # Custom logging setup
 ├── 📜 LICENSE                          # MIT License terms (Legal protection)
 ├── 📝 README.md                        # Project documentation
 ├── ⚙️ requirements.txt                 # Dependencies
@@ -220,4 +223,5 @@ If you use this toolkit in your research, please cite the following work:
 
 
 ## 📜 License
+
 This project is licensed under the MIT License - see the `LICENSE` file for details.
