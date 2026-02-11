@@ -1,0 +1,75 @@
+# ==============================================================================
+# ⚙️ MAIN CONFIGURATION - UNCERTAINTY-AWARE FEDERATED LEARNING
+# ==============================================================================
+
+# 1. System Settings
+system:
+  seed: 42                        # Global seed for reproducibility
+  gpu_memory_growth: true         # Allow dynamic GPU memory allocation (prevents allocation crashes)
+  mixed_precision: true           # Enable Mixed Precision (float16) to save VRAM and speed up training
+
+# 2. Federated Environment (Server)
+federated:
+  # Default strategy to be used by the evaluator or main entry point
+  # Options: "uncertainty_weighted" (Proposed Method) or "standard_fedavg" (Baseline)
+  strategy_name: "uncertainty_weighted"
+  
+  num_rounds: 10                  # Total number of federated communication rounds
+  num_clients: 10                 # Total number of available clients
+  fraction_fit: 1.0               # Fraction of clients used per round (1.0 = All clients)
+  logs_dir: "./fl_logs"           # Directory for storing federated logs
+
+# 3. Data Pipeline
+data:
+  # TIP: Use absolute paths or environment variables to avoid issues when running subprocesses
+  version: "v1.0-trainval"
+  raw_root: "/mnt/c/Users/USUARIO/Desktop/enviroments/Paper_NOUS/datasets/nuscenes"
+  root: "/mnt/c/Users/USUARIO/Desktop/enviroments/Paper_NOUS/datasets/nuscenes_preprocessed" 
+  split_path: "splits_federated/federated_split.json" # JSON file defining the data partition per client
+  
+  cameras: [
+    'CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
+    'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
+  ]
+
+  original_shape: [900, 1600]
+  input_shape: [320, 320, 3]      # Input dimensions [Height, Width, Channels]
+  num_classes: 14                 # Number of NuScenes classes
+  num_anchors: 9                  # Number of anchors per grid cell (RetinaNet style)
+
+# 4. Client Training (Local)
+client:
+  epochs: 5                       # Number of local training epochs per round
+  batch_size: 2                  # Local training batch size
+  val_batch_size: 2               # Batch size for validation/uncertainty estimation
+  learning_rate: 0.0001           # Initial learning rate
+  optimizer: "lamb"               # Optimizer type (e.g., 'lamb', 'adam')
+  
+  # Uncertainty Estimation Params
+  mc_samples: 5                   # Number of Monte Carlo forward passes for uncertainty calculation
+  diversity_sample_size: 2        # Number of validation samples used to calculate entropy/diversity
+
+  # Dynamic values (Placeholders for injection via Hydra/Subprocess)
+  id: 0                           # Client ID (0 to N-1)
+  manifest_path: ""               # Path to the specific data manifest for the client
+
+# 5. Model Architecture
+model:
+  name: "clr_bnn"                 # Model name identifier
+  backbone: "resnet50_bayesian"   # Backbone architecture
+  inject_priors: true             # Enable Transfer Learning by injecting ImageNet priors into Bayesian layers
+
+# 6. Aggregation Strategies Configuration
+strategy:
+  # A. Standard FedAvg (Baseline)
+  standard_fedavg:
+    weights_dir: "./fl_weights_standard"
+    meta_dir: "./fl_meta_standard"
+  
+  # B. Uncertainty-Aware Fusion (Proposed Method)
+  uncertainty_weighted:
+    # Hyperparameters for the weighting formula
+    gamma: 2.0  # Novelty Reward (Epistemic) - Strength of exponential boost for high uncertainty
+    beta: 1.0   # Noise Penalty (Aleatoric) - Strength of linear penalty for noisy data
+    weights_dir: "./fl_weights_uncertainty"
+    meta_dir: "./fl_meta_uncertainty"
